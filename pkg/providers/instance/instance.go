@@ -73,6 +73,13 @@ var InsufficientCapacityErrorCodes = sets.NewString(
 	"IP_SPACE_EXHAUSTED",
 )
 
+type insufficientCapacityDetails struct {
+	code             string
+	structuredReason string
+	message          string
+	operation        string
+}
+
 type Provider interface {
 	Create(context.Context, *v1alpha1.GCENodeClass, *karpv1.NodeClaim, []*cloudprovider.InstanceType) (*Instance, error)
 	Get(context.Context, string) (*Instance, error)
@@ -172,29 +179,24 @@ func waitForNextTick(ctx context.Context, ticker *time.Ticker) error {
 	}
 }
 
-// insufficientCapacityError carries the structured GCE reason code alongside the
+// insufficientCapacityError carries structured GCE details alongside the
 // human-readable reason. Callers need the code to decide whether another pod range
 // is worth trying before the offering is marked unavailable.
 type insufficientCapacityError struct {
-	reason     string
-	reasonCode string
+	details insufficientCapacityDetails
 }
 
 func (e *insufficientCapacityError) Error() string {
-	return e.reason
+	if e.details.message != "" {
+		return e.details.message
+	}
+	return e.details.code
 }
 
 func handleZoneOperationError(op *compute.Operation) error {
-	capacityError, found := lo.Find(op.Error.Errors, isInsufficientCapacityError)
+	details, found := extractOperationInsufficientCapacityDetails(op)
 	if found {
-		reason := capacityError.Message
-		if reason == "" {
-			reason = capacityError.Code
-		}
-		return &insufficientCapacityError{
-			reason:     reason,
-			reasonCode: capacityError.Code,
-		}
+		return &insufficientCapacityError{details: details}
 	}
 
 	errorMsgs := lo.Map(op.Error.Errors, func(e *compute.OperationErrorErrors, _ int) string {
@@ -218,23 +220,74 @@ func isInsufficientCapacityError(operationError *compute.OperationErrorErrors) b
 	return InsufficientCapacityErrorCodes.Has(operationError.Code)
 }
 
-func extractInsertInsufficientCapacityReason(err error) (string, string, bool) {
+func extractOperationInsufficientCapacityDetails(op *compute.Operation) (insufficientCapacityDetails, bool) {
+	if op == nil || op.Error == nil {
+		return insufficientCapacityDetails{}, false
+	}
+
+	capacityError, found := lo.Find(op.Error.Errors, isInsufficientCapacityError)
+	if !found {
+		return insufficientCapacityDetails{}, false
+	}
+
+	details := insufficientCapacityDetails{
+		code:      capacityError.Code,
+		message:   capacityError.Message,
+		operation: op.Name,
+	}
+	for _, detail := range capacityError.ErrorDetails {
+		if detail == nil {
+			continue
+		}
+		if details.structuredReason == "" && detail.ErrorInfo != nil {
+			details.structuredReason = detail.ErrorInfo.Reason
+		}
+		if detail.LocalizedMessage != nil && detail.LocalizedMessage.Message != "" {
+			details.message = detail.LocalizedMessage.Message
+		}
+	}
+	if details.message == "" {
+		details.message = details.code
+	}
+	return details, true
+}
+
+func extractInsertInsufficientCapacityDetails(err error) (insufficientCapacityDetails, bool) {
 	var apiError *googleapi.Error
 	if !errors.As(err, &apiError) {
-		return "", "", false
+		return insufficientCapacityDetails{}, false
 	}
 
 	for _, detail := range apiError.Errors {
 		if InsufficientCapacityErrorCodes.Has(detail.Reason) {
-			reason := detail.Message
-			if reason == "" {
-				reason = detail.Reason
+			message := detail.Message
+			if message == "" {
+				message = detail.Reason
 			}
-			return reason, detail.Reason, true
+			return insufficientCapacityDetails{
+				code:             detail.Reason,
+				structuredReason: detail.Reason,
+				message:          message,
+			}, true
 		}
 	}
 
-	return "", "", false
+	return insufficientCapacityDetails{}, false
+}
+
+func newInsufficientCapacityError(instanceType, zone, capacityType string, ttl time.Duration, details insufficientCapacityDetails) error {
+	gceDetails := []string{}
+	if details.structuredReason != "" && details.structuredReason != details.code {
+		gceDetails = append(gceDetails, "reason="+details.structuredReason)
+	}
+	if details.operation != "" {
+		gceDetails = append(gceDetails, "op="+details.operation)
+	}
+	gceDetails = append(gceDetails, "code="+details.code)
+	return cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
+		"%s %s/%s unavailable %s (%s): %s",
+		instanceType, capacityType, zone, ttl, strings.Join(gceDetails, ", "), details.message,
+	))
 }
 
 func insufficientCapacityBackoffTTL(reasonCode string) time.Duration {
@@ -252,12 +305,13 @@ func isIPSpaceExhausted(reasonCode string) bool {
 // markInsufficientCapacity records the offering as unavailable and converts the GCE
 // failure into the error type karpenter core understands. Only call this once no other
 // pod range is left to try, otherwise a successful fallback still evicts the offering.
-func (p *DefaultProvider) markInsufficientCapacity(ctx context.Context, reason, reasonCode, instanceType, zone, capacityType string) error {
-	if reason == "" {
-		reason = "insufficient capacity"
+func (p *DefaultProvider) markInsufficientCapacity(ctx context.Context, instanceType, zone, capacityType string, details insufficientCapacityDetails) error {
+	if details.message == "" {
+		details.message = "insufficient capacity"
 	}
-	p.unavailableOfferings.MarkUnavailableWithTTL(ctx, reason, instanceType, zone, capacityType, insufficientCapacityBackoffTTL(reasonCode))
-	return cloudprovider.NewInsufficientCapacityError(fmt.Errorf("zone %s insufficient capacity: %s", zone, reason))
+	ttl := insufficientCapacityBackoffTTL(details.code)
+	p.unavailableOfferings.MarkUnavailableWithTTL(ctx, details.message, instanceType, zone, capacityType, ttl)
+	return newInsufficientCapacityError(instanceType, zone, capacityType, ttl, details)
 }
 
 func logPodRangeExhausted(ctx context.Context, rangeName, instanceType, zone string) {
@@ -382,10 +436,6 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENod
 	}
 
 	joined := errors.Join(errs...)
-	if lo.SomeBy(errs, cloudprovider.IsInsufficientCapacityError) {
-		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("failed to create instance after trying all instance types: %w", joined))
-	}
-
 	return nil, fmt.Errorf("failed to create instance after trying all instance types: %w", joined)
 }
 
@@ -452,17 +502,17 @@ func (p *DefaultProvider) getOrCreateInstance(ctx context.Context, nodeClaim *ka
 		op, err := p.computeService.Instances.Insert(p.projectID, zone, instance).Context(ctx).Do()
 		if err != nil {
 			lastErr = err
-			reason, reasonCode, insufficient := extractInsertInsufficientCapacityReason(err)
-			if insufficient && isIPSpaceExhausted(reasonCode) && hasMoreRanges {
+			details, insufficient := extractInsertInsufficientCapacityDetails(err)
+			if insufficient && isIPSpaceExhausted(details.code) && hasMoreRanges {
 				logPodRangeExhausted(ctx, rangeName, instanceType.Name, zone)
 				continue
 			}
 			if insufficient {
-				err = p.markInsufficientCapacity(ctx, reason, reasonCode, instanceType.Name, zone, capacityType)
+				err = p.markInsufficientCapacity(ctx, instanceType.Name, zone, capacityType, details)
 
 				// If IP space is exhausted, trying other instance types won't help as they share the same subnet.
 				// We should fail fast to avoid unnecessary API calls and noise.
-				if isIPSpaceExhausted(reasonCode) {
+				if isIPSpaceExhausted(details.code) {
 					return nil, false, err
 				}
 			}
@@ -473,11 +523,11 @@ func (p *DefaultProvider) getOrCreateInstance(ctx context.Context, nodeClaim *ka
 		if err := p.waitOperationDone(ctx, zone, op.Name); err != nil {
 			lastErr = err
 			if capacityErr, ok := errors.AsType[*insufficientCapacityError](err); ok {
-				if isIPSpaceExhausted(capacityErr.reasonCode) && hasMoreRanges {
+				if isIPSpaceExhausted(capacityErr.details.code) && hasMoreRanges {
 					logPodRangeExhausted(ctx, rangeName, instanceType.Name, zone)
 					continue
 				}
-				err = p.markInsufficientCapacity(ctx, capacityErr.reason, capacityErr.reasonCode, instanceType.Name, zone, capacityType)
+				err = p.markInsufficientCapacity(ctx, instanceType.Name, zone, capacityType, capacityErr.details)
 			}
 			log.FromContext(ctx).Error(err, "failed to wait for operation to be done", "instanceType", instanceType.Name, "zone", zone)
 			return nil, true, err
